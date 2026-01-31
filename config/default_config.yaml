@@ -1,0 +1,170 @@
+# Vision-Based Adaptive Traffic Signal System Configuration
+
+# System settings
+system:
+  name: "Adaptive Traffic Signal Controller"
+  version: "1.0.0"
+  debug: false
+  log_level: "INFO"
+
+# Perception module settings
+perception:
+  model: "yolov8n"  # Options: yolov8n, yolov8s, yolov8m, yolov8l, yolov8x
+  confidence_threshold: 0.5
+  nms_threshold: 0.4
+  input_size: [640, 640]
+  device: "cuda"  # Options: cuda, cpu
+  
+  # Object classes to detect
+  classes:
+    vehicles:
+      - car
+      - bus
+      - truck
+      - motorcycle
+    pedestrians:
+      - person
+    cyclists:
+      - bicycle
+    emergency:
+      - ambulance
+      - fire_truck
+      - police_car
+
+# Multi-object tracking settings
+tracking:
+  algorithm: "sort"  # Options: sort, deep_sort, byte_track
+  max_age: 30  # Maximum frames to keep alive a track without associated detections
+  min_hits: 3  # Minimum hits to start a track
+  iou_threshold: 0.3
+  
+# Lane and queue estimation settings
+queue_estimation:
+  lane_count: 4
+  lane_width_pixels: 200
+  queue_length_update_rate: 1.0  # seconds
+  vehicle_length_meters: 4.5
+  meters_per_pixel: 0.1
+  
+  # Congestion thresholds
+  congestion:
+    low: 5  # vehicles
+    medium: 10
+    high: 20
+
+# Pedestrian safety settings
+safety:
+  # Minimum crossing time based on crossing width
+  min_crossing_time_per_meter: 1.5  # seconds per meter
+  default_crossing_width: 10  # meters
+  
+  # Pedestrian detection in crosswalk
+  crosswalk_safety_margin: 2.0  # seconds
+  pedestrian_clearance_time: 5.0  # seconds
+  
+  # High foot traffic thresholds
+  high_traffic_pedestrian_count: 10
+  phase_extension_increment: 5.0  # seconds
+  max_phase_extension: 30.0  # seconds
+
+# Emergency vehicle handling
+emergency:
+  detection_confidence: 0.7
+  preemption_delay: 2.0  # seconds before signal change
+  green_corridor_duration: 15.0  # seconds
+  cooldown_period: 10.0  # seconds after emergency passes
+  
+  # Visual cues for detection
+  flashing_light_detection: true
+  flashing_frequency_range: [1.0, 3.0]  # Hz
+
+# Reinforcement Learning settings
+rl_agent:
+  algorithm: "DQN"  # Options: DQN, PPO, A2C
+  
+  # State space
+  state_features:
+    - queue_lengths
+    - waiting_times
+    - pedestrian_counts
+    - emergency_detected
+    - current_phase
+  
+  # Action space (signal phases)
+  phases:
+    - name: "NS_Green"
+      description: "North-South Green, East-West Red"
+      min_duration: 10
+      max_duration: 60
+    - name: "EW_Green"
+      description: "East-West Green, North-South Red"
+      min_duration: 10
+      max_duration: 60
+    - name: "Pedestrian_All"
+      description: "All-way pedestrian crossing"
+      min_duration: 15
+      max_duration: 45
+  
+  # Reward weights
+  reward_weights:
+    vehicle_waiting_time: -1.0
+    pedestrian_waiting_time: -1.5
+    queue_length: -0.5
+    throughput: 1.0
+    safety_violation: -100.0
+    emergency_delay: -50.0
+  
+  # Training parameters
+  training:
+    learning_rate: 0.0001
+    gamma: 0.99
+    epsilon_start: 1.0
+    epsilon_end: 0.01
+    epsilon_decay: 0.995
+    batch_size: 64
+    buffer_size: 100000
+    target_update_freq: 1000
+    episodes: 10000
+    steps_per_episode: 500
+
+# SUMO Simulation settings
+simulation:
+  sumo_binary: "sumo-gui"  # Use "sumo" for headless
+  network_file: "intersection.net.xml"
+  route_file: "routes.rou.xml"
+  step_length: 1.0  # seconds
+  
+  # Traffic generation
+  traffic_density: "medium"  # Options: low, medium, high
+  pedestrian_probability: 0.3
+  emergency_probability: 0.01
+
+# Edge deployment settings
+edge:
+  target_fps: 15
+  max_latency_ms: 100
+  
+  # Model optimization
+  use_tensorrt: false
+  use_onnx: true
+  quantization: "int8"  # Options: fp32, fp16, int8
+  
+  # Hardware targets
+  supported_devices:
+    - nvidia_jetson
+    - google_coral
+    - cpu
+
+# Metrics and logging
+metrics:
+  collection_interval: 5.0  # seconds
+  export_format: "json"
+  
+  tracked_metrics:
+    - average_waiting_time
+    - max_waiting_time
+    - queue_length_per_lane
+    - throughput
+    - emergency_clearance_time
+    - inference_latency
+    - pedestrian_safety_score
