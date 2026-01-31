@@ -1,0 +1,36 @@
+# Vision-Based Adaptive Traffic Signal System Dependencies
+
+# Computer Vision & Deep Learning
+opencv-python>=4.8.0
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0  # YOLOv8 for object detection
+
+# Multi-Object Tracking
+filterpy>=1.4.5  # Kalman filtering
+scipy>=1.11.0
+
+# Reinforcement Learning
+gymnasium>=0.29.0
+stable-baselines3>=2.1.0
+
+# SUMO Traffic Simulation
+traci>=1.18.0
+sumolib>=1.18.0
+
+# Edge Deployment
+onnx>=1.14.0
+onnxruntime>=1.15.0
+
+# Utilities
+pyyaml>=6.0
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Logging and Monitoring
+tensorboard>=2.14.0
