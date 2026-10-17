@@ -1,170 +1,95 @@
-# Vision-Based Adaptive Traffic Signal System Configuration
+# Default configuration. Every key here is read by the code and validated on load
+# (see src/utils/config_loader.py). Override any value with an environment variable using
+# double underscores for nesting, e.g.  TRAFFIC__PERCEPTION__DEVICE=cuda
+#                                       TRAFFIC__SIGNAL__TIMING__YELLOW_S=4.5
 
-# System settings
 system:
-  name: "Adaptive Traffic Signal Controller"
-  version: "1.0.0"
-  debug: false
-  log_level: "INFO"
+  log_level: INFO            # DEBUG | INFO | WARNING | ERROR
 
-# Perception module settings
 perception:
-  model: "yolov8n"  # Options: yolov8n, yolov8s, yolov8m, yolov8l, yolov8x
+  model_name: yolov8n
+  model_path: models/yolov8n.pt   # not shipped; see README "Model setup"
+  allow_download: false           # true lets Ultralytics fetch stock weights by name
+  backend: torch                  # torch | onnx
+  onnx_path: models/yolov8n.onnx
+  device: cpu                     # cpu | cuda (falls back to cpu if CUDA is unavailable)
   confidence_threshold: 0.5
-  nms_threshold: 0.4
-  input_size: [640, 640]
-  device: "cuda"  # Options: cuda, cpu
-  
-  # Object classes to detect
-  classes:
-    vehicles:
-      - car
-      - bus
-      - truck
-      - motorcycle
-    pedestrians:
-      - person
-    cyclists:
-      - bicycle
-    emergency:
-      - ambulance
-      - fire_truck
-      - police_car
+  nms_threshold: 0.45
+  input_size: 640
+  min_box_area_px: 100
+  max_stale_s: 1.0                # frames older than this make the sensors "degraded"
+  max_consecutive_failures: 3     # failed frames before sensors_ok turns False
 
-# Multi-object tracking settings
 tracking:
-  algorithm: "sort"  # Options: sort, deep_sort, byte_track
-  max_age: 30  # Maximum frames to keep alive a track without associated detections
-  min_hits: 3  # Minimum hits to start a track
+  max_age: 30
+  min_hits: 3
   iou_threshold: 0.3
-  
-# Lane and queue estimation settings
+  output_coasting: 5              # keep reporting occluded tracks for this many frames
+  max_gap_s: 2.0                  # camera outage that drops all tracks
+
 queue_estimation:
-  lane_count: 4
-  lane_width_pixels: 200
-  queue_length_update_rate: 1.0  # seconds
+  stopped_speed: 0.15             # body-lengths/s below which a vehicle counts as stopped
+  min_stop_s: 1.0
+  meters_per_pixel: null          # null = no metre estimates (no camera calibration)
   vehicle_length_meters: 4.5
-  meters_per_pixel: 0.1
-  
-  # Congestion thresholds
-  congestion:
-    low: 5  # vehicles
-    medium: 10
-    high: 20
+  rate_window_s: 60
+  congestion_thresholds: {low: 5, medium: 10, high: 20}
+  lanes: []                       # [{id, approach, polygon: [[x,y],...], stop_line: [[x,y],[x,y]]}]
 
-# Pedestrian safety settings
-safety:
-  # Minimum crossing time based on crossing width
-  min_crossing_time_per_meter: 1.5  # seconds per meter
-  default_crossing_width: 10  # meters
-  
-  # Pedestrian detection in crosswalk
-  crosswalk_safety_margin: 2.0  # seconds
-  pedestrian_clearance_time: 5.0  # seconds
-  
-  # High foot traffic thresholds
-  high_traffic_pedestrian_count: 10
-  phase_extension_increment: 5.0  # seconds
-  max_phase_extension: 30.0  # seconds
+crosswalks: []                    # [{id: cw_N, polygon: [[x,y],...]}]
 
-# Emergency vehicle handling
 emergency:
   detection_confidence: 0.7
-  preemption_delay: 2.0  # seconds before signal change
-  green_corridor_duration: 15.0  # seconds
-  cooldown_period: 10.0  # seconds after emergency passes
-  
-  # Visual cues for detection
-  flashing_light_detection: true
-  flashing_frequency_range: [1.0, 3.0]  # Hz
+  min_detections: 3
+  hold_s: 5.0
 
-# Reinforcement Learning settings
-rl_agent:
-  algorithm: "DQN"  # Options: DQN, PPO, A2C
-  
-  # State space
-  state_features:
-    - queue_lengths
-    - waiting_times
-    - pedestrian_counts
-    - emergency_detected
-    - current_phase
-  
-  # Action space (signal phases)
-  phases:
-    - name: "NS_Green"
-      description: "North-South Green, East-West Red"
-      min_duration: 10
-      max_duration: 60
-    - name: "EW_Green"
-      description: "East-West Green, North-South Red"
-      min_duration: 10
-      max_duration: 60
-    - name: "Pedestrian_All"
-      description: "All-way pedestrian crossing"
-      min_duration: 15
-      max_duration: 45
-  
-  # Reward weights
-  reward_weights:
-    vehicle_waiting_time: -1.0
-    pedestrian_waiting_time: -1.5
-    queue_length: -0.5
-    throughput: 1.0
-    safety_violation: -100.0
-    emergency_delay: -50.0
-  
-  # Training parameters
-  training:
-    learning_rate: 0.0001
-    gamma: 0.99
+signal:
+  decision_interval_s: 5.0
+  timing:                         # seconds; see src/safety/signal_safety.py
+    yellow_s: 4.0
+    all_red_s: 2.0
+    min_green_s: 8.0
+    max_green_s: 45.0
+    ped_walk_min_s: 7.0
+    ped_walk_max_s: 25.0
+    ped_clearance_s: 8.0
+    max_conflict_hold_s: 20.0
+    max_pedestrian_wait_s: 90.0
+    uncertain_extra_all_red_s: 2.0
+    emergency_min_green_s: 4.0
+    emergency_extension_s: 15.0
+    fallback_green_s: 20.0
+    startup_all_red_s: 6.0
+  intersection: null              # null = built-in four-way NS/EW/PED model, or a custom model mapping
+  policy: actuated                # fixed | actuated | rl
+  rl_checkpoint: models/dqn_best.pt
+
+rl:
+  dqn:
+    learning_rate: 0.0005
+    gamma: 0.97
     epsilon_start: 1.0
-    epsilon_end: 0.01
-    epsilon_decay: 0.995
+    epsilon_end: 0.05
+    epsilon_decay_steps: 20000
     batch_size: 64
     buffer_size: 100000
-    target_update_freq: 1000
-    episodes: 10000
-    steps_per_episode: 500
+    learn_start: 1000
+    target_update_steps: 500
+    seed: 0
+  reward_weights:
+    vehicle_wait: 1.0
+    pedestrian_wait: 1.5
+    queue: 0.5
+    throughput: 0.5
+    fairness: 0.5
+    switching: 0.2
+    rejected: 0.1
+    violation: 10.0
+    emergency: 1.0
 
-# SUMO Simulation settings
 simulation:
-  sumo_binary: "sumo-gui"  # Use "sumo" for headless
-  network_file: "intersection.net.xml"
-  route_file: "routes.rou.xml"
-  step_length: 1.0  # seconds
-  
-  # Traffic generation
-  traffic_density: "medium"  # Options: low, medium, high
-  pedestrian_probability: 0.3
-  emergency_probability: 0.01
-
-# Edge deployment settings
-edge:
-  target_fps: 15
-  max_latency_ms: 100
-  
-  # Model optimization
-  use_tensorrt: false
-  use_onnx: true
-  quantization: "int8"  # Options: fp32, fp16, int8
-  
-  # Hardware targets
-  supported_devices:
-    - nvidia_jetson
-    - google_coral
-    - cpu
-
-# Metrics and logging
-metrics:
-  collection_interval: 5.0  # seconds
-  export_format: "json"
-  
-  tracked_metrics:
-    - average_waiting_time
-    - max_waiting_time
-    - queue_length_per_lane
-    - throughput
-    - emergency_clearance_time
-    - inference_latency
-    - pedestrian_safety_score
+  sumo_binary: sumo
+  step_length_s: 1.0
+  episode_s: 1800
+  scenario: medium
+  seed: 0

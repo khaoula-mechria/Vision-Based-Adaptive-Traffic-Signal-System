@@ -1,0 +1,5 @@
+-r requirements-rl.txt
+# SUMO via pip (Windows/Linux/macOS); alternatively install SUMO natively and set SUMO_HOME.
+eclipse-sumo>=1.18
+traci>=1.18
+sumolib>=1.18

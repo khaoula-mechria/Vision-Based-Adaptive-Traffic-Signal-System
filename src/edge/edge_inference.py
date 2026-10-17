@@ -1,384 +1,203 @@
-"""
-Edge Inference Module
-Optimized inference for edge devices (Jetson, Coral, etc.)
+"""ONNX Runtime inference for YOLOv8 (CPU, or CUDA/TensorRT when the provider is present).
+
+* Execution providers are checked against ``ort.get_available_providers()``; unavailable ones
+  are skipped with a warning and the *actually active* providers are reported.
+* Input handling: letterbox resize (aspect preserved), BGR->RGB, CHW float32 in [0,1].
+* Output decoding targets the Ultralytics YOLOv8 export layout ``[1, 4 + num_classes, N]``
+  (no objectness score), followed by class-wise NMS. Other layouts raise ``DetectionError``.
+* Jetson / Coral: nothing here is verified on that hardware. TensorRT is used only if the
+  ``TensorrtExecutionProvider`` is present in the installed onnxruntime build; Coral needs a
+  separate full-integer TFLite model and is not implemented.
 """
 
-import time
-from typing import Dict, List, Optional, Tuple, Any
+from __future__ import annotations
+
 import logging
+import os
+import time
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+
 import numpy as np
+
+from ..errors import DetectionError, ModelNotFoundError
+from ..perception.detection_result import DetectionResult
+from ..perception.postprocess import COCO_TRAFFIC_NAMES, FilterConfig, build_detections, validate_frame
 
 try:
     import onnxruntime as ort
-    ONNX_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover
     ort = None
-    ONNX_AVAILABLE = False
-
-from .hardware_config import HardwareConfig, DeviceType
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PROVIDERS = ("TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider")
 
-class EdgeInference:
-    """
-    Optimized inference engine for edge deployment.
-    
-    Features:
-    - ONNX Runtime optimization
-    - TensorRT acceleration (NVIDIA devices)
-    - Dynamic batching
-    - Latency monitoring
-    - Memory management
-    
-    Designed for real-world deployment on:
-    - NVIDIA Jetson (Nano, Xavier, Orin)
-    - Google Coral
-    - CPU-only systems
-    """
-    
+
+def select_providers(requested: Sequence[str] = DEFAULT_PROVIDERS, available: Optional[Sequence[str]] = None) -> List[str]:
+    """Keep requested providers that are actually installed; CPU is always the last resort."""
+    if available is None:
+        if ort is None:
+            raise ImportError("onnxruntime is required: pip install -r requirements-vision.txt")
+        available = ort.get_available_providers()
+    chosen = [p for p in requested if p in available]
+    for p in requested:
+        if p not in available:
+            logger.info("execution provider %s not available; skipping", p)
+    if "CPUExecutionProvider" not in chosen:
+        chosen.append("CPUExecutionProvider")
+    return chosen
+
+
+def letterbox(img: np.ndarray, size: int, pad_value: int = 114) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+    """Resize keeping aspect ratio and pad to ``size``x``size``. Returns (image, scale, (pad_x, pad_y))."""
+    import cv2
+
+    h, w = img.shape[:2]
+    scale = min(size / h, size / w)
+    nh, nw = int(round(h * scale)), int(round(w * scale))
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR) if (nh, nw) != (h, w) else img
+    out = np.full((size, size, 3), pad_value, dtype=img.dtype)
+    px, py = (size - nw) // 2, (size - nh) // 2
+    out[py:py + nh, px:px + nw] = resized
+    return out, scale, (px, py)
+
+
+def nms(boxes: np.ndarray, scores: np.ndarray, iou_thr: float) -> np.ndarray:
+    """Greedy NMS; boxes are xyxy. Returns kept indices."""
+    order = scores.argsort()[::-1]
+    keep = []
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    while order.size:
+        i = order[0]
+        keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(boxes[i, 0], boxes[rest, 0])
+        yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
+        xx2 = np.minimum(boxes[i, 2], boxes[rest, 2])
+        yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[rest] - inter + 1e-9)
+        order = rest[iou <= iou_thr]
+    return np.asarray(keep, dtype=int)
+
+
+class OnnxYoloDetector:
+    """Drop-in alternative to ``ObjectDetector`` with the same ``detect`` interface."""
+
     def __init__(
         self,
         model_path: str,
-        config: Optional[HardwareConfig] = None,
-    ):
-        """
-        Initialize edge inference engine.
-        
-        Args:
-            model_path: Path to model file (ONNX, TensorRT, or TFLite)
-            config: Hardware configuration
-        """
+        names: Optional[Mapping[int, str]] = None,
+        filter_config: Optional[FilterConfig] = None,
+        providers: Sequence[str] = DEFAULT_PROVIDERS,
+        input_size: int = 640,
+        nms_threshold: float = 0.45,
+        session=None,
+    ) -> None:
         self.model_path = model_path
-        self.config = config or HardwareConfig.for_cpu()
-        
-        self.session = None
-        self.input_name = None
-        self.output_names = None
-        
-        # Performance monitoring
-        self.inference_times: List[float] = []
+        self.names = dict(names) if names else dict(COCO_TRAFFIC_NAMES)
+        self.filter = filter_config or FilterConfig()
+        self.filter.validate()
+        self.input_size = int(input_size)
+        self.nms_threshold = nms_threshold
+        self.requested_providers = tuple(providers)
+        self.session = session  # injectable for tests
         self.frame_count = 0
-        
-    def load_model(self):
-        """Load and optimize model for inference"""
-        if self.config.use_onnx and ONNX_AVAILABLE:
-            self._load_onnx_model()
-        elif self.config.use_tensorrt:
-            self._load_tensorrt_model()
-        else:
-            logger.warning("No supported inference runtime available")
-    
-    def _load_onnx_model(self):
-        """Load ONNX model with optimizations"""
-        if not ONNX_AVAILABLE:
-            raise ImportError("onnxruntime not available")
-        
-        # Configure session options
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        # Set number of threads based on hardware
-        if self.config.device_type == DeviceType.CPU:
-            import multiprocessing
-            sess_options.intra_op_num_threads = multiprocessing.cpu_count()
-        
-        # Select execution provider
-        providers = self._get_execution_providers()
-        
-        try:
-            self.session = ort.InferenceSession(
-                self.model_path,
-                sess_options=sess_options,
-                providers=providers,
-            )
-            
-            # Get input/output info
-            self.input_name = self.session.get_inputs()[0].name
-            self.output_names = [o.name for o in self.session.get_outputs()]
-            
-            logger.info(f"ONNX model loaded with providers: {providers}")
-        except Exception as e:
-            logger.error(f"Failed to load ONNX model: {e}")
-            raise
-    
-    def _get_execution_providers(self) -> List[str]:
-        """Get appropriate execution providers for hardware"""
-        providers = []
-        
-        if self.config.device_type in [
-            DeviceType.NVIDIA_JETSON_NANO,
-            DeviceType.NVIDIA_JETSON_XAVIER,
-            DeviceType.NVIDIA_JETSON_ORIN,
-        ]:
-            # Try CUDA/TensorRT
-            if 'TensorrtExecutionProvider' in ort.get_available_providers():
-                providers.append('TensorrtExecutionProvider')
-            if 'CUDAExecutionProvider' in ort.get_available_providers():
-                providers.append('CUDAExecutionProvider')
-        
-        # Always add CPU as fallback
-        providers.append('CPUExecutionProvider')
-        
-        return providers
-    
-    def _load_tensorrt_model(self):
-        """Load TensorRT optimized model"""
-        # TensorRT loading would be implemented here
-        # This requires trt Python bindings
-        logger.warning("TensorRT loading not fully implemented")
-        self._load_onnx_model()  # Fallback to ONNX
-    
-    def preprocess(
-        self,
-        image: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Preprocess image for inference.
-        
-        Args:
-            image: Input image (BGR, HWC format)
-            
-        Returns:
-            Preprocessed tensor
-        """
-        target_size = self.config.get_model_input_size()
-        
-        # Resize
-        import cv2
-        resized = cv2.resize(image, target_size)
-        
-        # Convert BGR to RGB
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        
-        # Normalize to [0, 1]
-        normalized = rgb.astype(np.float32) / 255.0
-        
-        # Convert to CHW format
-        transposed = np.transpose(normalized, (2, 0, 1))
-        
-        # Add batch dimension
-        batched = np.expand_dims(transposed, axis=0)
-        
-        return batched
-    
-    def infer(
-        self,
-        input_tensor: np.ndarray,
-    ) -> List[np.ndarray]:
-        """
-        Run inference on preprocessed input.
-        
-        Args:
-            input_tensor: Preprocessed input tensor
-            
-        Returns:
-            List of output tensors
-        """
-        if self.session is None:
+        self.latencies_ms: List[float] = []
+        if session is None:
             self.load_model()
-        
-        start_time = time.time()
-        
-        # Run inference
-        outputs = self.session.run(
-            self.output_names,
-            {self.input_name: input_tensor},
-        )
-        
-        # Record timing
-        inference_time = (time.time() - start_time) * 1000
-        self.inference_times.append(inference_time)
+        self.input_name = self.session.get_inputs()[0].name
+
+    def load_model(self) -> None:
+        if not os.path.isfile(self.model_path):
+            raise ModelNotFoundError(f"ONNX model not found: {self.model_path}")
+        providers = select_providers(self.requested_providers)
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self.session = ort.InferenceSession(self.model_path, sess_options=opts, providers=providers)
+        logger.info("ONNX session providers: %s", self.session.get_providers())
+
+    @property
+    def active_providers(self) -> List[str]:
+        return list(self.session.get_providers()) if hasattr(self.session, "get_providers") else []
+
+    def preprocess(self, frame: np.ndarray) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+        img, scale, pad = letterbox(frame, self.input_size)
+        x = np.ascontiguousarray(img[:, :, ::-1].transpose(2, 0, 1), dtype=np.float32) / 255.0
+        return x[None], scale, pad
+
+    def decode(self, out: np.ndarray, scale: float, pad: Tuple[int, int], frame_hw: Tuple[int, int]) -> DetectionResult:
+        arr = np.asarray(out)
+        if arr.ndim != 3 or arr.shape[0] != 1:
+            raise DetectionError(f"unexpected ONNX output shape {arr.shape}; expected [1, 4+C, N]")
+        pred = arr[0]
+        if pred.shape[0] > 1000 and pred.shape[1] < pred.shape[0]:  # anchors-first export [N, 4+C]
+            pred = pred.T
+        if pred.shape[0] < 5:
+            raise DetectionError(f"unexpected ONNX output shape {arr.shape}")
+        boxes_cxcywh, scores = pred[:4].T, pred[4:].T
+        cls = scores.argmax(1)
+        conf = scores[np.arange(len(cls)), cls]
+        m = conf >= min(self.filter.confidence_threshold, *self.filter.per_class_confidence.values()) \
+            if self.filter.per_class_confidence else conf >= self.filter.confidence_threshold
+        boxes_cxcywh, conf, cls = boxes_cxcywh[m], conf[m], cls[m]
+        xyxy = np.stack([boxes_cxcywh[:, 0] - boxes_cxcywh[:, 2] / 2, boxes_cxcywh[:, 1] - boxes_cxcywh[:, 3] / 2,
+                         boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] / 2, boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] / 2], 1)
+        xyxy[:, [0, 2]] = (xyxy[:, [0, 2]] - pad[0]) / scale
+        xyxy[:, [1, 3]] = (xyxy[:, [1, 3]] - pad[1]) / scale
+        kept: list = []
+        for k in np.unique(cls):  # class-wise NMS
+            idx = np.where(cls == k)[0]
+            kept.extend(idx[nms(xyxy[idx], conf[idx], self.nms_threshold)])
+        keep = np.asarray(sorted(kept), dtype=int)
+        dets = build_detections(xyxy[keep], conf[keep], cls[keep], self.names, self.filter, frame_hw) if len(keep) else []
+        return DetectionResult(frame_id=self.frame_count, timestamp=0.0, detections=dets)
+
+    def detect(self, frame: np.ndarray, timestamp: Optional[float] = None) -> DetectionResult:
+        validate_frame(frame)
         self.frame_count += 1
-        
-        # Keep only recent times for monitoring
-        if len(self.inference_times) > 100:
-            self.inference_times = self.inference_times[-100:]
-        
-        return outputs
-    
-    def detect(
-        self,
-        image: np.ndarray,
-        confidence_threshold: float = 0.5,
-    ) -> List[Dict]:
-        """
-        Run complete detection pipeline.
-        
-        Args:
-            image: Input image (BGR format)
-            confidence_threshold: Minimum detection confidence
-            
-        Returns:
-            List of detections with bboxes and classes
-        """
-        # Preprocess
-        input_tensor = self.preprocess(image)
-        
-        # Infer
-        outputs = self.infer(input_tensor)
-        
-        # Postprocess (YOLO format assumed)
-        detections = self._postprocess_yolo(
-            outputs,
-            image.shape[:2],
-            confidence_threshold,
-        )
-        
-        return detections
-    
-    def _postprocess_yolo(
-        self,
-        outputs: List[np.ndarray],
-        original_size: Tuple[int, int],
-        confidence_threshold: float,
-    ) -> List[Dict]:
-        """Postprocess YOLO outputs"""
-        detections = []
-        
-        # YOLO output format: [batch, num_detections, 5 + num_classes]
-        # [x_center, y_center, width, height, confidence, class_probs...]
-        
-        if len(outputs) == 0:
-            return detections
-        
-        predictions = outputs[0]
-        
-        if len(predictions.shape) == 3:
-            predictions = predictions[0]  # Remove batch dimension
-        
-        input_size = self.config.get_model_input_size()
-        scale_x = original_size[1] / input_size[0]
-        scale_y = original_size[0] / input_size[1]
-        
-        for pred in predictions:
-            confidence = pred[4]
-            if confidence < confidence_threshold:
-                continue
-            
-            # Get class with highest probability
-            class_probs = pred[5:]
-            class_id = np.argmax(class_probs)
-            class_conf = class_probs[class_id]
-            
-            if confidence * class_conf < confidence_threshold:
-                continue
-            
-            # Convert to corner format and scale
-            x_center, y_center, width, height = pred[:4]
-            x1 = (x_center - width / 2) * scale_x
-            y1 = (y_center - height / 2) * scale_y
-            x2 = (x_center + width / 2) * scale_x
-            y2 = (y_center + height / 2) * scale_y
-            
-            detections.append({
-                "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                "confidence": float(confidence * class_conf),
-                "class_id": int(class_id),
-            })
-        
-        return detections
-    
-    def get_latency_stats(self) -> Dict[str, float]:
-        """Get inference latency statistics"""
-        if not self.inference_times:
-            return {
-                "mean_ms": 0.0,
-                "std_ms": 0.0,
-                "min_ms": 0.0,
-                "max_ms": 0.0,
-                "fps": 0.0,
-            }
-        
-        times = np.array(self.inference_times)
-        return {
-            "mean_ms": float(np.mean(times)),
-            "std_ms": float(np.std(times)),
-            "min_ms": float(np.min(times)),
-            "max_ms": float(np.max(times)),
-            "fps": 1000.0 / np.mean(times) if np.mean(times) > 0 else 0.0,
-        }
-    
-    def meets_latency_target(self) -> bool:
-        """Check if inference meets latency target"""
-        if not self.inference_times:
-            return True
-        
-        avg_latency = np.mean(self.inference_times)
-        return avg_latency <= self.config.max_latency_ms
-    
-    def meets_fps_target(self) -> bool:
-        """Check if inference meets FPS target"""
-        stats = self.get_latency_stats()
-        return stats["fps"] >= self.config.target_fps
-    
-    def get_summary(self) -> Dict:
-        """Get inference engine summary"""
-        latency_stats = self.get_latency_stats()
-        
-        return {
-            "model_path": self.model_path,
-            "hardware": self.config.to_dict(),
-            "frames_processed": self.frame_count,
-            "latency": latency_stats,
-            "meets_latency_target": self.meets_latency_target(),
-            "meets_fps_target": self.meets_fps_target(),
-        }
-    
-    def reset_stats(self):
-        """Reset performance statistics"""
-        self.inference_times.clear()
-        self.frame_count = 0
+        x, scale, pad = self.preprocess(frame)
+        t0 = time.perf_counter()
+        try:
+            out = self.session.run(None, {self.input_name: x})[0]
+        except Exception as exc:  # noqa: BLE001
+            raise DetectionError(f"ONNX inference failed: {exc}") from exc
+        ms = (time.perf_counter() - t0) * 1000.0
+        self.latencies_ms.append(ms)
+        self.latencies_ms = self.latencies_ms[-500:]
+        res = self.decode(out, scale, pad, frame.shape[:2])
+        res.timestamp = time.time() if timestamp is None else timestamp
+        res.inference_time_ms = ms
+        res.update_counts()
+        return res
+
+    def benchmark(self, frame: Optional[np.ndarray] = None, warmup: int = 10, runs: int = 100) -> Dict[str, float]:
+        """Measure end-to-end ``detect`` latency (pre-process + inference + decode) after warm-up."""
+        frame = frame if frame is not None else np.random.default_rng(0).integers(0, 255, (480, 640, 3), dtype=np.uint8)
+        for _ in range(warmup):
+            self.detect(frame)
+        lat = []
+        for _ in range(runs):
+            t0 = time.perf_counter()
+            self.detect(frame)
+            lat.append((time.perf_counter() - t0) * 1000.0)
+        a = np.asarray(lat)
+        rss = None
+        try:
+            import psutil
+
+            rss = psutil.Process().memory_info().rss / 1e6
+        except ImportError:
+            pass
+        return {"runs": runs, "mean_ms": float(a.mean()), "p50_ms": float(np.percentile(a, 50)),
+                "p95_ms": float(np.percentile(a, 95)), "max_ms": float(a.max()), "fps": float(1000.0 / a.mean()),
+                "rss_mb": rss if rss is not None else float("nan")}
 
 
-def optimize_model_for_edge(
-    input_model_path: str,
-    output_model_path: str,
-    config: HardwareConfig,
-) -> str:
-    """
-    Optimize model for edge deployment.
-    
-    Args:
-        input_model_path: Path to input model
-        output_model_path: Path for optimized model
-        config: Target hardware configuration
-        
-    Returns:
-        Path to optimized model
-    """
-    if not ONNX_AVAILABLE:
-        logger.warning("ONNX not available, skipping optimization")
-        return input_model_path
-    
-    try:
-        import onnx
-        from onnxruntime.transformers import optimizer
-        
-        # Load model
-        model = onnx.load(input_model_path)
-        
-        # Optimize
-        optimized = optimizer.optimize_model(
-            input_model_path,
-            model_type='bert',  # Generic optimization
-            num_heads=0,
-            hidden_size=0,
-        )
-        
-        # Apply quantization if requested
-        if config.quantization == "fp16":
-            optimized.convert_float_to_float16()
-        elif config.quantization == "int8":
-            # INT8 quantization requires calibration data
-            logger.warning("INT8 quantization requires calibration, skipping")
-        
-        # Save optimized model
-        optimized.save_model_to_file(output_model_path)
-        
-        logger.info(f"Model optimized and saved to {output_model_path}")
-        return output_model_path
-        
-    except Exception as e:
-        logger.error(f"Model optimization failed: {e}")
-        return input_model_path
+def export_yolo_to_onnx(weights: str, imgsz: int = 640) -> str:
+    """Export Ultralytics weights to ONNX next to the .pt file (requires ultralytics + onnx)."""
+    from ultralytics import YOLO
+
+    return str(YOLO(weights).export(format="onnx", imgsz=imgsz, simplify=False))

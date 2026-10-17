@@ -1,8 +1,5 @@
-"""
-Emergency Vehicle handling module initialization
-"""
+"""Emergency vehicle confirmation (preemption itself is executed by the safety manager)."""
 
 from .emergency_handler import EmergencyVehicleHandler
-from .emergency_state import EmergencyState, EmergencyVehicle
 
-__all__ = ["EmergencyVehicleHandler", "EmergencyState", "EmergencyVehicle"]
+__all__ = ["EmergencyVehicleHandler"]

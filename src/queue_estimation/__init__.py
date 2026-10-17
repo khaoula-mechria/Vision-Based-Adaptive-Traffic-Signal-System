@@ -2,7 +2,7 @@
 Queue Estimation module initialization
 """
 
-from .queue_estimator import QueueEstimator
 from .lane import Lane, LaneState
+from .queue_estimator import QueueEstimator
 
 __all__ = ["QueueEstimator", "Lane", "LaneState"]

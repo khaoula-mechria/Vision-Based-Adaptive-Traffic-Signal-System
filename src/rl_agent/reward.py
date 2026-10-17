@@ -1,237 +1,80 @@
+"""Reward for the signal-control RL agent.
+
+Design notes
+------------
+* Computed from per-interval *deltas* (waiting accrued, vehicles discharged, switches),
+  not cumulative counters.
+* Fixed scales, no running-mean normalisation: the reward stays stationary across episodes.
+* Safety is **not** enforced through this reward. Unsafe actions are filtered by
+  ``SignalSafetyManager`` before execution; the ``rejected`` / ``violation`` terms only
+  discourage proposing actions the safety layer has to override and make violations visible
+  in training curves.
 """
-Reward Calculator for Traffic Signal RL Agent
-"""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Optional
+
 import numpy as np
 
 
 @dataclass
 class RewardWeights:
-    """Weights for different reward components"""
-    vehicle_waiting_time: float = -1.0  # Penalty for vehicle waiting
-    pedestrian_waiting_time: float = -1.5  # Higher penalty for pedestrian waiting
-    queue_length: float = -0.5  # Penalty for queue buildup
-    throughput: float = 1.0  # Reward for vehicles passing
-    safety_violation: float = -100.0  # Large penalty for safety violations
-    emergency_delay: float = -50.0  # Penalty for delaying emergency vehicles
-    smooth_transition: float = 0.1  # Small reward for smooth transitions
+    vehicle_wait: float = 1.0
+    pedestrian_wait: float = 1.5
+    queue: float = 0.5
+    throughput: float = 0.5
+    fairness: float = 0.5  # penalise the longest wait on any approach (starvation)
+    switching: float = 0.2  # per actual phase change in the interval
+    rejected: float = 0.1  # action had to be overridden by the safety layer
+    violation: float = 10.0  # auditor-detected violation (should never occur)
+    emergency: float = 1.0  # emergency vehicle waiting
+    clip: float = 5.0
+
+
+@dataclass
+class IntervalStats:
+    """Quantities measured over one decision interval."""
+
+    vehicle_wait_s: float  # vehicle-seconds of waiting accrued
+    pedestrian_wait_s: float  # person-seconds of waiting accrued
+    mean_queue: float  # mean halting vehicles (all approaches) over the interval
+    discharged: float  # vehicles that passed the stop line
+    max_approach_wait_s: float
+    phase_changes: int
+    rejected: bool
+    violations: int
+    emergency_wait_s: float
+    duration_s: float
 
 
 class RewardCalculator:
-    """
-    Calculates reward for the traffic signal RL agent.
-    
-    The reward function balances:
-    - Reduced vehicle waiting time
-    - Reduced pedestrian delay
-    - Congestion avoidance
-    - Safety compliance (highest priority)
-    - Emergency vehicle clearance
-    """
-    
-    def __init__(
-        self,
-        weights: Optional[RewardWeights] = None,
-        normalize: bool = True,
-    ):
-        """
-        Initialize reward calculator.
-        
-        Args:
-            weights: Reward component weights
-            normalize: Whether to normalize reward
-        """
-        self.weights = weights or RewardWeights()
-        self.normalize = normalize
-        
-        # Running statistics for normalization
-        self._reward_mean = 0.0
-        self._reward_std = 1.0
-        self._reward_count = 0
-    
-    def calculate(
-        self,
-        state: Dict,
-        action: int,
-        next_state: Dict,
-        info: Dict,
-    ) -> float:
-        """
-        Calculate total reward.
-        
-        Args:
-            state: Current state before action
-            action: Action taken
-            next_state: State after action
-            info: Additional information
-            
-        Returns:
-            Total reward value
-        """
-        reward = 0.0
-        
-        # Vehicle waiting time penalty
-        vehicle_wait = self._calculate_vehicle_waiting_penalty(state, next_state)
-        reward += self.weights.vehicle_waiting_time * vehicle_wait
-        
-        # Pedestrian waiting time penalty
-        ped_wait = self._calculate_pedestrian_waiting_penalty(state, next_state)
-        reward += self.weights.pedestrian_waiting_time * ped_wait
-        
-        # Queue length penalty
-        queue_penalty = self._calculate_queue_penalty(next_state)
-        reward += self.weights.queue_length * queue_penalty
-        
-        # Throughput reward
-        throughput = self._calculate_throughput_reward(state, next_state)
-        reward += self.weights.throughput * throughput
-        
-        # Safety violation penalty
-        if info.get("safety_violation", False):
-            reward += self.weights.safety_violation
-        
-        # Emergency delay penalty
-        if info.get("emergency_delayed", False):
-            emergency_delay_time = info.get("emergency_delay_time", 0)
-            reward += self.weights.emergency_delay * (1 + emergency_delay_time / 10.0)
-        
-        # Smooth transition bonus
-        if info.get("smooth_transition", True):
-            reward += self.weights.smooth_transition
-        
-        # Normalize if enabled
-        if self.normalize:
-            reward = self._normalize_reward(reward)
-        
-        return reward
-    
-    def _calculate_vehicle_waiting_penalty(
-        self,
-        state: Dict,
-        next_state: Dict,
-    ) -> float:
-        """Calculate penalty based on vehicle waiting times"""
-        if "waiting_times" not in next_state:
-            return 0.0
-        
-        waiting_times = next_state["waiting_times"]
-        if not isinstance(waiting_times, (list, np.ndarray)):
-            waiting_times = [waiting_times]
-        
-        # Penalty increases with waiting time
-        if len(waiting_times) == 0:
-            return 0.0
-        
-        avg_wait = np.mean(waiting_times)
-        max_wait = np.max(waiting_times)
-        
-        # Combined penalty with emphasis on maximum wait
-        return avg_wait + 0.5 * max_wait
-    
-    def _calculate_pedestrian_waiting_penalty(
-        self,
-        state: Dict,
-        next_state: Dict,
-    ) -> float:
-        """Calculate penalty based on pedestrian waiting times"""
-        if "pedestrian_waiting_times" not in next_state:
-            return 0.0
-        
-        waiting_times = next_state["pedestrian_waiting_times"]
-        if not isinstance(waiting_times, (list, np.ndarray)):
-            waiting_times = [waiting_times]
-        
-        if len(waiting_times) == 0:
-            return 0.0
-        
-        # Pedestrians are more sensitive to waiting
-        avg_wait = np.mean(waiting_times)
-        return avg_wait * 1.2  # 20% higher sensitivity
-    
-    def _calculate_queue_penalty(self, next_state: Dict) -> float:
-        """Calculate penalty based on queue lengths"""
-        if "queue_lengths" not in next_state:
-            return 0.0
-        
-        queue_lengths = next_state["queue_lengths"]
-        if not isinstance(queue_lengths, (list, np.ndarray)):
-            queue_lengths = [queue_lengths]
-        
-        if len(queue_lengths) == 0:
-            return 0.0
-        
-        # Penalty for total queue and imbalance
-        total_queue = np.sum(queue_lengths)
-        queue_std = np.std(queue_lengths)  # Imbalance penalty
-        
-        return total_queue + 2 * queue_std
-    
-    def _calculate_throughput_reward(
-        self,
-        state: Dict,
-        next_state: Dict,
-    ) -> float:
-        """Calculate reward based on vehicle throughput"""
-        vehicles_passed = next_state.get("vehicles_passed", 0)
-        return float(vehicles_passed)
-    
-    def _normalize_reward(self, reward: float) -> float:
-        """Normalize reward using running statistics"""
-        # Update running statistics
-        self._reward_count += 1
-        delta = reward - self._reward_mean
-        self._reward_mean += delta / self._reward_count
-        delta2 = reward - self._reward_mean
-        self._reward_std = np.sqrt(
-            (self._reward_std**2 * (self._reward_count - 1) + delta * delta2) 
-            / self._reward_count
-        )
-        
-        # Normalize
-        if self._reward_std > 1e-6:
-            return (reward - self._reward_mean) / self._reward_std
-        return reward - self._reward_mean
-    
-    def get_reward_breakdown(
-        self,
-        state: Dict,
-        action: int,
-        next_state: Dict,
-        info: Dict,
-    ) -> Dict[str, float]:
-        """
-        Get detailed breakdown of reward components.
-        
-        Useful for debugging and understanding agent behavior.
-        """
-        breakdown = {}
-        
-        vehicle_wait = self._calculate_vehicle_waiting_penalty(state, next_state)
-        breakdown["vehicle_waiting"] = self.weights.vehicle_waiting_time * vehicle_wait
-        
-        ped_wait = self._calculate_pedestrian_waiting_penalty(state, next_state)
-        breakdown["pedestrian_waiting"] = self.weights.pedestrian_waiting_time * ped_wait
-        
-        queue_penalty = self._calculate_queue_penalty(next_state)
-        breakdown["queue_length"] = self.weights.queue_length * queue_penalty
-        
-        throughput = self._calculate_throughput_reward(state, next_state)
-        breakdown["throughput"] = self.weights.throughput * throughput
-        
-        if info.get("safety_violation", False):
-            breakdown["safety_violation"] = self.weights.safety_violation
-        
-        if info.get("emergency_delayed", False):
-            breakdown["emergency_delay"] = self.weights.emergency_delay
-        
-        breakdown["total"] = sum(breakdown.values())
-        
-        return breakdown
-    
-    def reset_normalization(self):
-        """Reset normalization statistics"""
-        self._reward_mean = 0.0
-        self._reward_std = 1.0
-        self._reward_count = 0
+    # Scales chosen so each term is O(1) for a moderately loaded intersection at 5 s intervals.
+    VEH_WAIT_SCALE = 100.0
+    PED_WAIT_SCALE = 50.0
+    QUEUE_SCALE = 20.0
+    THROUGHPUT_SCALE = 5.0
+    WAIT_CAP_S = 120.0
+
+    def __init__(self, weights: Optional[RewardWeights] = None) -> None:
+        self.w = weights or RewardWeights()
+
+    def breakdown(self, s: IntervalStats) -> Dict[str, float]:
+        w = self.w
+        k = max(s.duration_s, 1e-6) / 5.0  # scale accrual terms to the interval length
+        return {
+            "vehicle_wait": -w.vehicle_wait * s.vehicle_wait_s / (self.VEH_WAIT_SCALE * k),
+            "pedestrian_wait": -w.pedestrian_wait * s.pedestrian_wait_s / (self.PED_WAIT_SCALE * k),
+            "queue": -w.queue * s.mean_queue / self.QUEUE_SCALE,
+            "throughput": w.throughput * s.discharged / (self.THROUGHPUT_SCALE * k),
+            "fairness": -w.fairness * min(s.max_approach_wait_s, self.WAIT_CAP_S) / self.WAIT_CAP_S,
+            "switching": -w.switching * s.phase_changes,
+            "rejected": -w.rejected if s.rejected else 0.0,
+            "violation": -w.violation * s.violations,
+            "emergency": -w.emergency * s.emergency_wait_s / max(s.duration_s, 1.0),
+        }
+
+    def __call__(self, s: IntervalStats) -> float:
+        total = float(sum(self.breakdown(s).values()))
+        return float(np.clip(total, -2 * self.w.clip, self.w.clip))

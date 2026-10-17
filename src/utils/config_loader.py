@@ -1,238 +1,126 @@
-"""
-Configuration loader utility
+"""Validated YAML configuration with environment-variable overrides.
+
+Defaults come from ``config/default_config.yaml`` (single source of truth). Layers, lowest to
+highest priority: defaults < user YAML file < ``TRAFFIC__SECTION__KEY=value`` environment
+variables (values are parsed as YAML scalars, so ``true``, ``4.5`` and ``[1, 2]`` work).
+Unknown keys / override paths and out-of-range values raise ``ConfigError``.
 """
 
-import os
-from typing import Any, Dict, Optional
+from __future__ import annotations
+
+import copy
 import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional
 
-try:
-    import yaml
-    YAML_AVAILABLE = True
-except ImportError:
-    yaml = None
-    YAML_AVAILABLE = False
+import yaml
+
+from ..errors import ConfigError
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PATH = Path(__file__).resolve().parents[2] / "config" / "default_config.yaml"
+ENV_PREFIX = "TRAFFIC__"
+
+# path -> (type(s), min, max, choices)
+_RULES: Dict[str, tuple] = {
+    "system.log_level": (str, None, None, {"DEBUG", "INFO", "WARNING", "ERROR"}),
+    "perception.backend": (str, None, None, {"torch", "onnx"}),
+    "perception.device": (str, None, None, None),
+    "perception.confidence_threshold": ((int, float), 0.0, 1.0, None),
+    "perception.nms_threshold": ((int, float), 0.0, 1.0, None),
+    "perception.input_size": (int, 32, 4096, None),
+    "perception.max_stale_s": ((int, float), 0.0, 3600.0, None),
+    "perception.max_consecutive_failures": (int, 1, 1000, None),
+    "tracking.max_age": (int, 1, 10000, None),
+    "tracking.min_hits": (int, 1, 100, None),
+    "tracking.iou_threshold": ((int, float), 0.0, 1.0, None),
+    "tracking.output_coasting": (int, 0, 10000, None),
+    "queue_estimation.stopped_speed": ((int, float), 1e-6, 100.0, None),
+    "emergency.detection_confidence": ((int, float), 0.0, 1.0, None),
+    "emergency.min_detections": (int, 1, 100, None),
+    "signal.decision_interval_s": ((int, float), 0.1, 60.0, None),
+    "signal.policy": (str, None, None, {"fixed", "actuated", "rl"}),
+    "rl.dqn.gamma": ((int, float), 0.0, 1.0, None),
+    "rl.dqn.learning_rate": ((int, float), 1e-9, 1.0, None),
+    "simulation.step_length_s": ((int, float), 0.01, 5.0, None),
+    "simulation.episode_s": ((int, float), 1.0, 1e7, None),
+}
+
+
+def _merge(base: Dict[str, Any], over: Mapping[str, Any], path: str = "") -> None:
+    for k, v in over.items():
+        if k not in base:
+            raise ConfigError(f"unknown configuration key {path + str(k)!r}")
+        if isinstance(base[k], dict) and isinstance(v, Mapping):
+            _merge(base[k], v, f"{path}{k}.")
+        else:
+            base[k] = v
+
 
 class ConfigLoader:
-    """
-    Configuration loader for the traffic signal system.
-    
-    Supports:
-    - YAML configuration files
-    - Environment variable overrides
-    - Default values
-    """
-    
-    DEFAULT_CONFIG = {
-        "system": {
-            "name": "Adaptive Traffic Signal Controller",
-            "version": "1.0.0",
-            "debug": False,
-            "log_level": "INFO",
-        },
-        "perception": {
-            "model": "yolov8n",
-            "confidence_threshold": 0.5,
-            "nms_threshold": 0.4,
-            "device": "cpu",
-        },
-        "tracking": {
-            "algorithm": "sort",
-            "max_age": 30,
-            "min_hits": 3,
-            "iou_threshold": 0.3,
-        },
-        "queue_estimation": {
-            "vehicle_length_meters": 4.5,
-            "meters_per_pixel": 0.1,
-        },
-        "safety": {
-            "min_crossing_time_per_meter": 1.5,
-            "high_traffic_pedestrian_count": 10,
-        },
-        "emergency": {
-            "detection_confidence": 0.7,
-            "green_corridor_duration": 15.0,
-            "cooldown_period": 10.0,
-        },
-        "rl_agent": {
-            "algorithm": "DQN",
-            "learning_rate": 0.0001,
-            "gamma": 0.99,
-        },
-        "edge": {
-            "target_fps": 15,
-            "max_latency_ms": 100,
-            "use_onnx": True,
-        },
-    }
-    
-    def __init__(self, config_path: Optional[str] = None):
-        """
-        Initialize configuration loader.
-        
-        Args:
-            config_path: Path to configuration file
-        """
+    def __init__(self, config_path: Optional[str] = None, env: Optional[Mapping[str, str]] = None) -> None:
+        with open(DEFAULT_PATH, encoding="utf-8") as fh:
+            self.config: Dict[str, Any] = yaml.safe_load(fh)
         self.config_path = config_path
-        self.config: Dict[str, Any] = {}
-        
-        # Load default config
-        self._load_defaults()
-        
-        # Load from file if provided
         if config_path:
-            self._load_from_file(config_path)
-        
-        # Apply environment overrides
-        self._apply_env_overrides()
-    
-    def _load_defaults(self):
-        """Load default configuration"""
-        self.config = self._deep_copy(self.DEFAULT_CONFIG)
-    
-    def _load_from_file(self, path: str):
-        """Load configuration from YAML file"""
-        if not os.path.exists(path):
-            logger.warning(f"Configuration file not found: {path}")
-            return
-        
-        if not YAML_AVAILABLE:
-            logger.warning("PyYAML not available, cannot load config file")
-            return
-        
-        try:
-            with open(path, 'r') as f:
-                file_config = yaml.safe_load(f)
-            
-            if file_config:
-                self._merge_config(self.config, file_config)
-                logger.info(f"Configuration loaded from {path}")
-        except Exception as e:
-            logger.error(f"Failed to load configuration: {e}")
-    
-    def _apply_env_overrides(self):
-        """Apply environment variable overrides"""
-        # Format: TRAFFIC_SECTION_KEY=value
-        prefix = "TRAFFIC_"
-        
-        for key, value in os.environ.items():
-            if key.startswith(prefix):
-                parts = key[len(prefix):].lower().split("_")
-                if len(parts) >= 2:
-                    section = parts[0]
-                    setting = "_".join(parts[1:])
-                    
-                    if section in self.config:
-                        # Try to parse value type
-                        parsed_value = self._parse_env_value(value)
-                        self.config[section][setting] = parsed_value
-                        logger.debug(f"Config override: {section}.{setting} = {parsed_value}")
-    
-    def _parse_env_value(self, value: str) -> Any:
-        """Parse environment variable value to appropriate type"""
-        # Boolean
-        if value.lower() in ("true", "yes", "1"):
-            return True
-        if value.lower() in ("false", "no", "0"):
-            return False
-        
-        # Number
-        try:
-            if "." in value:
-                return float(value)
-            return int(value)
-        except ValueError:
-            pass
-        
-        return value
-    
-    def _merge_config(self, base: Dict, override: Dict):
-        """Recursively merge override into base config"""
-        for key, value in override.items():
-            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-                self._merge_config(base[key], value)
-            else:
-                base[key] = value
-    
-    def _deep_copy(self, obj: Any) -> Any:
-        """Deep copy a nested dictionary"""
-        if isinstance(obj, dict):
-            return {k: self._deep_copy(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._deep_copy(item) for item in obj]
-        return obj
-    
+            p = Path(config_path)
+            if not p.is_file():
+                raise ConfigError(f"configuration file not found: {p}")
+            try:
+                data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            except yaml.YAMLError as exc:
+                raise ConfigError(f"invalid YAML in {p}: {exc}") from exc
+            if not isinstance(data, Mapping):
+                raise ConfigError(f"{p}: top level must be a mapping")
+            _merge(self.config, data)
+        self._apply_env(os.environ if env is None else env)
+        self.validate()
+
+    def _apply_env(self, env: Mapping[str, str]) -> None:
+        for key, raw in env.items():
+            if not key.startswith(ENV_PREFIX):
+                continue
+            parts = [p.lower() for p in key[len(ENV_PREFIX):].split("__") if p]
+            node: Any = self.config
+            for part in parts[:-1]:
+                if not isinstance(node, dict) or part not in node:
+                    raise ConfigError(f"environment override {key}: unknown path")
+                node = node[part]
+            if not isinstance(node, dict) or parts[-1] not in node:
+                raise ConfigError(f"environment override {key}: unknown key")
+            try:
+                node[parts[-1]] = yaml.safe_load(raw)
+            except yaml.YAMLError as exc:
+                raise ConfigError(f"environment override {key}: bad value {raw!r}") from exc
+
+    def validate(self) -> None:
+        for path, (types, lo, hi, choices) in _RULES.items():
+            val = self.get(path)
+            if val is None:
+                raise ConfigError(f"missing required setting {path}")
+            if isinstance(val, bool) or not isinstance(val, types):
+                raise ConfigError(f"{path}: expected {types}, got {type(val).__name__} ({val!r})")
+            if (lo is not None and val < lo) or (hi is not None and val > hi):
+                raise ConfigError(f"{path}={val!r} outside [{lo}, {hi}]")
+            if choices is not None and val not in choices:
+                raise ConfigError(f"{path}={val!r} not one of {sorted(choices)}")
+        from ..safety.signal_safety import SignalTiming  # deeper timing checks live with the type
+
+        SignalTiming.from_dict(self.config["signal"]["timing"])
+
     def get(self, key: str, default: Any = None) -> Any:
-        """
-        Get configuration value using dot notation.
-        
-        Args:
-            key: Configuration key (e.g., 'perception.model')
-            default: Default value if key not found
-            
-        Returns:
-            Configuration value
-        """
-        parts = key.split(".")
-        value = self.config
-        
-        for part in parts:
-            if isinstance(value, dict) and part in value:
-                value = value[part]
+        node: Any = self.config
+        for part in key.split("."):
+            if isinstance(node, Mapping) and part in node:
+                node = node[part]
             else:
                 return default
-        
-        return value
-    
-    def get_section(self, section: str) -> Dict:
-        """Get entire configuration section"""
-        return self.config.get(section, {})
-    
-    def set(self, key: str, value: Any):
-        """
-        Set configuration value using dot notation.
-        
-        Args:
-            key: Configuration key
-            value: Value to set
-        """
-        parts = key.split(".")
-        config = self.config
-        
-        for part in parts[:-1]:
-            if part not in config:
-                config[part] = {}
-            config = config[part]
-        
-        config[parts[-1]] = value
-    
-    def save(self, path: Optional[str] = None):
-        """
-        Save configuration to file.
-        
-        Args:
-            path: Output path (uses original path if None)
-        """
-        if not YAML_AVAILABLE:
-            logger.warning("PyYAML not available, cannot save config")
-            return
-        
-        save_path = path or self.config_path
-        if not save_path:
-            logger.warning("No save path specified")
-            return
-        
-        try:
-            with open(save_path, 'w') as f:
-                yaml.dump(self.config, f, default_flow_style=False)
-            logger.info(f"Configuration saved to {save_path}")
-        except Exception as e:
-            logger.error(f"Failed to save configuration: {e}")
-    
-    def to_dict(self) -> Dict:
-        """Get full configuration as dictionary"""
-        return self._deep_copy(self.config)
+        return node
+
+    def get_section(self, section: str) -> Dict[str, Any]:
+        return copy.deepcopy(self.config.get(section, {}))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.config)

@@ -1,8 +1,5 @@
-"""
-Edge Deployment module initialization
-"""
+"""ONNX Runtime edge inference and benchmarking."""
 
-from .edge_inference import EdgeInference
-from .hardware_config import HardwareConfig
+from .edge_inference import OnnxYoloDetector, select_providers
 
-__all__ = ["EdgeInference", "HardwareConfig"]
+__all__ = ["OnnxYoloDetector", "select_providers"]

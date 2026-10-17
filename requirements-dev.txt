@@ -1,0 +1,7 @@
+-r requirements-vision.txt
+-r requirements-sim.txt
+pytest>=7.4
+hypothesis>=6.90
+ruff>=0.4
+mypy>=1.8
+types-PyYAML

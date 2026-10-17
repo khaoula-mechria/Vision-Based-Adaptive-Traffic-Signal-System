@@ -1,0 +1,4 @@
+-r requirements.txt
+# Training / evaluating the DQN agent. Install a CUDA build of torch from pytorch.org if you want GPU training.
+torch>=2.1,<3
+gymnasium>=0.29,<2

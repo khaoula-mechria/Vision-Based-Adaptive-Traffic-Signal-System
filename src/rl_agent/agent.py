@@ -1,473 +1,289 @@
-"""
-Traffic Signal RL Agent
-Implements DQN and PPO agents for signal optimization
+"""Double-DQN agent for traffic signal phase selection.
+
+* Experience replay (uniform) and a target network (hard update every ``target_update_steps``
+  gradient steps), Double-DQN targets, Huber loss, gradient clipping.
+* Epsilon-greedy exploration with a linear schedule over environment steps. Exploration only
+  happens when ``select_action(..., training=True)``; evaluation is always greedy.
+* Time-limit truncation is *not* treated as terminal (bootstraps through it).
+* Reproducible: one seed controls torch, numpy exploration and replay sampling.
+* Checkpoints store network, optimiser, counters, config and dimensions; ``load`` validates
+  dimensions and refuses missing files instead of silently using a random policy.
+
+PPO/A2C were intentionally not added: the action space is a handful of discrete phase
+requests, DQN is sufficient, and no experiment here justifies the extra complexity.
 """
 
-import os
-from typing import Any, Dict, List, Optional, Tuple
-import numpy as np
+from __future__ import annotations
+
+import json
 import logging
+import os
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
+
+from ..errors import ConfigError, ModelNotFoundError
 
 try:
     import torch
     import torch.nn as nn
-    import torch.optim as optim
-    from collections import deque
-    import random
-    TORCH_AVAILABLE = True
-except ImportError:
-    torch = None
-    nn = None
-    optim = None
-    TORCH_AVAILABLE = False
+    import torch.nn.functional as F
 
-# Import deque separately since it's used without torch
-from collections import deque
-import random
+    TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+    TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 
-class DQNNetwork:
-    """Deep Q-Network architecture (requires PyTorch)"""
-    
-    def __init__(self, state_dim: int, action_dim: int, hidden_dims: List[int] = None):
-        if not TORCH_AVAILABLE:
-            raise ImportError("PyTorch is required for DQNNetwork")
-        
-        # Initialize as nn.Module
-        import torch.nn as nn_module
-        
-        if hidden_dims is None:
-            hidden_dims = [256, 256, 128]
-        
-        layers = []
-        prev_dim = state_dim
-        
-        for hidden_dim in hidden_dims:
-            layers.append(nn_module.Linear(prev_dim, hidden_dim))
-            layers.append(nn_module.ReLU())
-            prev_dim = hidden_dim
-        
-        layers.append(nn_module.Linear(prev_dim, action_dim))
-        
-        self.network = nn_module.Sequential(*layers)
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-    
-    def forward(self, x):
-        return self.network(x)
-    
-    def __call__(self, x):
-        return self.forward(x)
-    
-    def to(self, device):
-        self.network = self.network.to(device)
-        return self
-    
-    def state_dict(self):
-        return self.network.state_dict()
-    
-    def load_state_dict(self, state_dict):
-        self.network.load_state_dict(state_dict)
-    
-    def parameters(self):
-        return self.network.parameters()
+@dataclass
+class DQNConfig:
+    learning_rate: float = 5e-4
+    gamma: float = 0.97
+    epsilon_start: float = 1.0
+    epsilon_end: float = 0.05
+    epsilon_decay_steps: int = 20000
+    batch_size: int = 64
+    buffer_size: int = 100_000
+    learn_start: int = 1000
+    train_every: int = 1
+    target_update_steps: int = 500
+    hidden_dims: tuple = (128, 128)
+    grad_clip: float = 5.0
+    seed: int = 0
+    device: str = "cpu"
+
+    def validate(self) -> None:
+        if not 0 < self.gamma <= 1:
+            raise ConfigError("gamma must be in (0, 1]")
+        if self.learning_rate <= 0 or self.batch_size <= 0 or self.buffer_size < self.batch_size:
+            raise ConfigError("invalid learning_rate / batch_size / buffer_size")
+        if not 0 <= self.epsilon_end <= self.epsilon_start <= 1:
+            raise ConfigError("epsilon schedule must satisfy 0 <= end <= start <= 1")
+        if self.learn_start < self.batch_size:
+            raise ConfigError("learn_start must be >= batch_size")
 
 
 class ReplayBuffer:
-    """Experience replay buffer for DQN"""
-    
-    def __init__(self, capacity: int = 100000):
-        self.buffer = deque(maxlen=capacity)
-    
-    def push(
-        self,
-        state: np.ndarray,
-        action: int,
-        reward: float,
-        next_state: np.ndarray,
-        done: bool,
-    ):
-        """Add experience to buffer"""
-        self.buffer.append((state, action, reward, next_state, done))
-    
-    def sample(self, batch_size: int) -> Tuple:
-        """Sample a batch of experiences"""
-        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
-        states, actions, rewards, next_states, dones = zip(*batch)
-        
-        return (
-            np.array(states),
-            np.array(actions),
-            np.array(rewards),
-            np.array(next_states),
-            np.array(dones),
-        )
-    
-    def __len__(self):
-        return len(self.buffer)
+    """Uniform replay with preallocated arrays."""
+
+    def __init__(self, capacity: int, state_dim: int, rng: np.random.Generator) -> None:
+        self.capacity = capacity
+        self.rng = rng
+        self.s = np.zeros((capacity, state_dim), np.float32)
+        self.s2 = np.zeros((capacity, state_dim), np.float32)
+        self.a = np.zeros(capacity, np.int64)
+        self.r = np.zeros(capacity, np.float32)
+        self.d = np.zeros(capacity, np.float32)
+        self.pos = 0
+        self.size = 0
+
+    def push(self, s, a, r, s2, terminated: bool) -> None:
+        i = self.pos
+        self.s[i], self.a[i], self.r[i], self.s2[i], self.d[i] = s, a, r, s2, float(terminated)
+        self.pos = (i + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, n: int):
+        idx = self.rng.integers(0, self.size, size=min(n, self.size))
+        return self.s[idx], self.a[idx], self.r[idx], self.s2[idx], self.d[idx]
+
+    def __len__(self) -> int:
+        return self.size
+
+
+def _build_mlp(in_dim: int, out_dim: int, hidden: tuple):
+    layers: List[Any] = []
+    prev = in_dim
+    for h in hidden:
+        layers += [nn.Linear(prev, h), nn.ReLU()]
+        prev = h
+    layers.append(nn.Linear(prev, out_dim))
+    return nn.Sequential(*layers)
 
 
 class TrafficSignalAgent:
-    """
-    Reinforcement Learning agent for traffic signal control.
-    
-    Supports:
-    - DQN (Deep Q-Network)
-    - Integration with stable-baselines3 for PPO/A2C
-    
-    The agent:
-    - Observes lane-level traffic states and pedestrian density
-    - Selects signal phase durations and transitions
-    - Optimizes for reduced waiting time while maintaining safety
-    """
-    
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        algorithm: str = "DQN",
-        learning_rate: float = 0.0001,
-        gamma: float = 0.99,
-        epsilon_start: float = 1.0,
-        epsilon_end: float = 0.01,
-        epsilon_decay: float = 0.995,
-        batch_size: int = 64,
-        buffer_size: int = 100000,
-        target_update_freq: int = 1000,
-        device: str = "auto",
-    ):
-        """
-        Initialize the RL agent.
-        
-        Args:
-            state_dim: Dimension of state space
-            action_dim: Number of actions
-            algorithm: RL algorithm ('DQN', 'PPO', 'A2C')
-            learning_rate: Learning rate
-            gamma: Discount factor
-            epsilon_start: Initial exploration rate
-            epsilon_end: Final exploration rate
-            epsilon_decay: Exploration decay rate
-            batch_size: Training batch size
-            buffer_size: Replay buffer size
-            target_update_freq: Target network update frequency
-            device: Device to use ('auto', 'cuda', 'cpu')
-        """
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.algorithm = algorithm
-        self.learning_rate = learning_rate
-        self.gamma = gamma
-        self.epsilon = epsilon_start
-        self.epsilon_start = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
-        self.batch_size = batch_size
-        self.target_update_freq = target_update_freq
-        
-        # Determine device
-        if device == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if TORCH_AVAILABLE else "cpu"
-        else:
-            self.device = torch.device(device) if TORCH_AVAILABLE else device
-        
-        # Initialize based on algorithm
-        if algorithm == "DQN" and TORCH_AVAILABLE:
-            self._init_dqn(buffer_size)
-        elif algorithm in ["PPO", "A2C"]:
-            self._init_sb3(algorithm)
-        else:
-            logger.warning(f"Algorithm {algorithm} not available, using random policy")
-            self.model = None
-        
-        # Training statistics
-        self.training_steps = 0
+    def __init__(self, state_dim: int, action_dim: int, config: Optional[DQNConfig] = None) -> None:
+        if not TORCH_AVAILABLE:
+            raise ImportError("PyTorch is required for the DQN agent: pip install -r requirements-rl.txt")
+        self.cfg = config or DQNConfig()
+        self.cfg.validate()
+        self.state_dim, self.action_dim = int(state_dim), int(action_dim)
+        self.device = torch.device(self.cfg.device)
+        torch.manual_seed(self.cfg.seed)
+        self._rng = np.random.default_rng(self.cfg.seed)
+        self.q_net = _build_mlp(state_dim, action_dim, self.cfg.hidden_dims).to(self.device)
+        self.target_net = _build_mlp(state_dim, action_dim, self.cfg.hidden_dims).to(self.device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.target_net.eval()
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.cfg.learning_rate)
+        self.replay = ReplayBuffer(self.cfg.buffer_size, state_dim, self._rng)
+        self.env_steps = 0
+        self.grad_steps = 0
         self.episodes = 0
-        self.total_reward = 0.0
-        self.episode_rewards: List[float] = []
-    
-    def _init_dqn(self, buffer_size: int):
-        """Initialize DQN components"""
-        # Q-networks
-        self.q_network = DQNNetwork(self.state_dim, self.action_dim).to(self.device)
-        self.target_network = DQNNetwork(self.state_dim, self.action_dim).to(self.device)
-        self.target_network.load_state_dict(self.q_network.state_dict())
-        
-        # Optimizer
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=self.learning_rate)
-        
-        # Replay buffer
-        self.replay_buffer = ReplayBuffer(buffer_size)
-        
-        self.model = self.q_network
-    
-    def _init_sb3(self, algorithm: str):
-        """Initialize stable-baselines3 agent"""
-        try:
-            from stable_baselines3 import PPO, A2C
-            from stable_baselines3.common.vec_env import DummyVecEnv
-            
-            # Model will be created when training starts
-            self.sb3_class = PPO if algorithm == "PPO" else A2C
-            self.model = None
-            logger.info(f"Stable-baselines3 {algorithm} initialized")
-        except ImportError:
-            logger.warning("stable-baselines3 not available")
-            self.model = None
-    
-    def select_action(
-        self,
-        state: np.ndarray,
-        training: bool = True,
-    ) -> int:
-        """
-        Select an action given current state.
-        
-        Args:
-            state: Current observation
-            training: Whether in training mode (enables exploration)
-            
-        Returns:
-            Selected action
-        """
-        if self.algorithm == "DQN" and TORCH_AVAILABLE and self.model is not None:
-            return self._select_action_dqn(state, training)
-        elif self.model is not None and hasattr(self.model, 'predict'):
-            # Stable-baselines3
-            action, _ = self.model.predict(state, deterministic=not training)
-            return int(action)
-        else:
-            # Random policy
-            return np.random.randint(0, self.action_dim)
-    
-    def _select_action_dqn(self, state: np.ndarray, training: bool) -> int:
-        """Select action using DQN with epsilon-greedy"""
-        # Epsilon-greedy exploration
-        if training and np.random.random() < self.epsilon:
-            return np.random.randint(0, self.action_dim)
-        
-        # Greedy action
+        self.history: List[Dict[str, float]] = []
+
+    # ------------------------------------------------------------- acting
+    @property
+    def epsilon(self) -> float:
+        c = self.cfg
+        frac = min(1.0, self.env_steps / max(1, c.epsilon_decay_steps))
+        return c.epsilon_start + frac * (c.epsilon_end - c.epsilon_start)
+
+    def select_action(self, state: np.ndarray, training: bool = False) -> int:
+        """Greedy action; epsilon-greedy only when ``training=True``."""
+        state = np.asarray(state, dtype=np.float32)
+        if state.shape != (self.state_dim,):
+            raise ValueError(f"expected state shape ({self.state_dim},), got {state.shape}")
+        if training and self._rng.random() < self.epsilon:
+            return int(self._rng.integers(0, self.action_dim))
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            q_values = self.q_network(state_tensor)
-            return q_values.argmax(dim=1).item()
-    
-    def store_experience(
-        self,
-        state: np.ndarray,
-        action: int,
-        reward: float,
-        next_state: np.ndarray,
-        done: bool,
-    ):
-        """Store experience in replay buffer (DQN only)"""
-        if self.algorithm == "DQN" and hasattr(self, 'replay_buffer'):
-            self.replay_buffer.push(state, action, reward, next_state, done)
-    
-    def train_step(self) -> Optional[float]:
-        """
-        Perform one training step.
-        
-        Returns:
-            Loss value if training occurred, None otherwise
-        """
-        if self.algorithm == "DQN":
-            return self._train_step_dqn()
+            q = self.q_net(torch.from_numpy(state).unsqueeze(0).to(self.device))
+            return int(q.argmax(dim=1).item())
+
+    # ----------------------------------------------------------- learning
+    def observe(self, s, a, r, s2, terminated: bool) -> Optional[float]:
+        """Store a transition and (when due) take one gradient step. Training mode only."""
+        self.replay.push(s, a, r, s2, terminated)
+        self.env_steps += 1
+        if len(self.replay) >= self.cfg.learn_start and self.env_steps % self.cfg.train_every == 0:
+            return self._learn()
         return None
-    
-    def _train_step_dqn(self) -> Optional[float]:
-        """DQN training step"""
-        if not TORCH_AVAILABLE or len(self.replay_buffer) < self.batch_size:
-            return None
-        
-        # Sample batch
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-        
-        # Convert to tensors
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.LongTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).to(self.device)
-        
-        # Current Q values
-        current_q = self.q_network(states).gather(1, actions.unsqueeze(1))
-        
-        # Target Q values (Double DQN)
+
+    def _learn(self) -> float:
+        c = self.cfg
+        s, a, r, s2, d = (torch.from_numpy(x).to(self.device) for x in self.replay.sample(c.batch_size))
+        q = self.q_net(s).gather(1, a.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
-            next_actions = self.q_network(next_states).argmax(dim=1, keepdim=True)
-            next_q = self.target_network(next_states).gather(1, next_actions)
-            target_q = rewards.unsqueeze(1) + self.gamma * next_q * (1 - dones.unsqueeze(1))
-        
-        # Loss
-        loss = nn.MSELoss()(current_q, target_q)
-        
-        # Optimize
+            best = self.q_net(s2).argmax(dim=1, keepdim=True)  # Double DQN
+            nxt = self.target_net(s2).gather(1, best).squeeze(1)
+            target = r + c.gamma * (1.0 - d) * nxt
+        loss = F.smooth_l1_loss(q, target)
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(self.q_net.parameters(), c.grad_clip)
         self.optimizer.step()
-        
-        # Update target network
-        self.training_steps += 1
-        if self.training_steps % self.target_update_freq == 0:
-            self.target_network.load_state_dict(self.q_network.state_dict())
-        
-        # Decay epsilon
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        
-        return loss.item()
-    
+        self.grad_steps += 1
+        if self.grad_steps % c.target_update_steps == 0:
+            self.target_net.load_state_dict(self.q_net.state_dict())
+        return float(loss.item())
+
     def train(
         self,
         env,
-        episodes: int = 1000,
-        log_interval: int = 100,
-        save_path: Optional[str] = None,
-    ) -> List[float]:
+        episodes: int,
+        seeds: Optional[List[int]] = None,
+        eval_env=None,
+        eval_seeds: Optional[List[int]] = None,
+        eval_every: int = 10,
+        checkpoint_dir: Optional[str] = None,
+        log_fn: Optional[Callable[[Dict[str, float]], None]] = None,
+        before_episode: Optional[Callable[[int, int], None]] = None,
+        eval_setup: Optional[Callable[[int, int], None]] = None,
+    ) -> List[Dict[str, float]]:
+        """Train for ``episodes`` episodes. Training and evaluation use separate envs/seeds.
+
+        If ``eval_env`` is given, the checkpoint with the best greedy evaluation return is
+        saved as ``best.pt`` (selection uses ``eval_seeds`` that should be disjoint from
+        training seeds); ``last.pt`` is always written at the end.
         """
-        Train the agent.
-        
-        Args:
-            env: Training environment
-            episodes: Number of training episodes
-            log_interval: Logging interval
-            save_path: Path to save model
-            
-        Returns:
-            List of episode rewards
-        """
-        logger.info(f"Starting training for {episodes} episodes")
-        
-        for episode in range(episodes):
-            state, _ = env.reset()
-            episode_reward = 0.0
-            done = False
-            
+        best = -np.inf
+        for ep in range(episodes):
+            seed = seeds[ep % len(seeds)] if seeds else self.cfg.seed + ep
+            if before_episode:
+                before_episode(ep, seed)  # e.g. switch the demand scenario
+            s, _ = env.reset(seed=seed)
+            total, losses, done = 0.0, [], False
             while not done:
-                # Select and execute action
-                action = self.select_action(state, training=True)
-                next_state, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                
-                # Store experience and train
-                self.store_experience(state, action, reward, next_state, done)
-                loss = self.train_step()
-                
-                # Update state
-                state = next_state
-                episode_reward += reward
-            
-            # Episode complete
+                a = self.select_action(s, training=True)
+                s2, r, terminated, truncated, info = env.step(a)
+                loss = self.observe(s, a, r, s2, terminated)  # truncation is NOT terminal
+                if loss is not None:
+                    losses.append(loss)
+                s, total, done = s2, total + r, terminated or truncated
             self.episodes += 1
-            self.episode_rewards.append(episode_reward)
-            
-            # Logging
-            if (episode + 1) % log_interval == 0:
-                avg_reward = np.mean(self.episode_rewards[-log_interval:])
-                logger.info(
-                    f"Episode {episode + 1}/{episodes}, "
-                    f"Avg Reward: {avg_reward:.2f}, "
-                    f"Epsilon: {self.epsilon:.3f}"
-                )
-                
-                # Save checkpoint
-                if save_path:
-                    self.save(f"{save_path}_ep{episode + 1}.pt")
-        
-        # Final save
-        if save_path:
-            self.save(f"{save_path}_final.pt")
-        
-        return self.episode_rewards
-    
-    def evaluate(
-        self,
-        env,
-        episodes: int = 10,
-    ) -> Dict[str, float]:
-        """
-        Evaluate the agent.
-        
-        Args:
-            env: Evaluation environment
-            episodes: Number of evaluation episodes
-            
-        Returns:
-            Dictionary of evaluation metrics
-        """
-        rewards = []
-        waiting_times = []
-        queue_lengths = []
-        throughputs = []
-        
-        for _ in range(episodes):
-            state, _ = env.reset()
-            episode_reward = 0.0
-            done = False
-            
+            rec: Dict[str, float] = {
+                "episode": self.episodes, "train_return": total, "epsilon": self.epsilon,
+                "loss": float(np.mean(losses)) if losses else float("nan"),
+                "env_steps": self.env_steps,
+            }
+            if eval_env is not None and (ep + 1) % eval_every == 0:
+                ev = self.evaluate(eval_env, eval_seeds or [10_000 + i for i in range(3)], setup=eval_setup)
+                rec.update({f"eval_{k}": v for k, v in ev.items()})
+                if checkpoint_dir and ev["mean_return"] > best:
+                    best = ev["mean_return"]
+                    self.save(os.path.join(checkpoint_dir, "best.pt"))
+            self.history.append(rec)
+            if log_fn:
+                log_fn(rec)
+        if checkpoint_dir:
+            self.save(os.path.join(checkpoint_dir, "last.pt"))
+            with open(os.path.join(checkpoint_dir, "history.json"), "w", encoding="utf-8") as fh:
+                json.dump(self.history, fh)
+        return self.history
+
+    def evaluate(self, env, seeds: List[int], setup: Optional[Callable[[int, int], None]] = None) -> Dict[str, float]:
+        """Greedy rollouts. Does not store experience, change epsilon or update weights."""
+        self.q_net.eval()
+        returns, summaries = [], []
+        for i, seed in enumerate(seeds):
+            if setup:
+                setup(i, seed)
+            s, _ = env.reset(seed=seed)
+            total, done = 0.0, False
             while not done:
-                action = self.select_action(state, training=False)
-                state, reward, terminated, truncated, info = env.step(action)
+                s, r, terminated, truncated, info = env.step(self.select_action(s, training=False))
+                total += r
                 done = terminated or truncated
-                
-                episode_reward += reward
-                waiting_times.append(info.get("avg_waiting_time", 0))
-                queue_lengths.append(info.get("total_queue", 0))
-                throughputs.append(info.get("vehicles_passed", 0))
-            
-            rewards.append(episode_reward)
-        
-        return {
-            "mean_reward": np.mean(rewards),
-            "std_reward": np.std(rewards),
-            "mean_waiting_time": np.mean(waiting_times),
-            "mean_queue_length": np.mean(queue_lengths),
-            "total_throughput": np.sum(throughputs),
-        }
-    
-    def save(self, path: str):
-        """Save model to file"""
-        if self.algorithm == "DQN" and TORCH_AVAILABLE and self.model is not None:
-            torch.save({
-                "q_network": self.q_network.state_dict(),
-                "target_network": self.target_network.state_dict(),
+            returns.append(total)
+            summaries.append(env.summary())
+        self.q_net.train()
+        out = {"mean_return": float(np.mean(returns)), "std_return": float(np.std(returns))}
+        for k in summaries[0]:
+            out[k] = float(np.mean([m[k] for m in summaries]))
+        return out
+
+    # ---------------------------------------------------------- persistence
+    def save(self, path: str) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        torch.save(
+            {
+                "format": 1,
+                "state_dim": self.state_dim,
+                "action_dim": self.action_dim,
+                "config": asdict(self.cfg),
+                "q_net": self.q_net.state_dict(),
+                "target_net": self.target_net.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
-                "epsilon": self.epsilon,
-                "training_steps": self.training_steps,
+                "env_steps": self.env_steps,
+                "grad_steps": self.grad_steps,
                 "episodes": self.episodes,
-            }, path)
-            logger.info(f"Model saved to {path}")
-        elif self.model is not None and hasattr(self.model, 'save'):
-            self.model.save(path)
-    
-    def load(self, path: str):
-        """Load model from file"""
-        if not os.path.exists(path):
-            logger.warning(f"Model file not found: {path}")
-            return
-        
-        if self.algorithm == "DQN" and TORCH_AVAILABLE:
-            checkpoint = torch.load(path, map_location=self.device)
-            self.q_network.load_state_dict(checkpoint["q_network"])
-            self.target_network.load_state_dict(checkpoint["target_network"])
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-            self.epsilon = checkpoint.get("epsilon", self.epsilon_end)
-            self.training_steps = checkpoint.get("training_steps", 0)
-            self.episodes = checkpoint.get("episodes", 0)
-            logger.info(f"Model loaded from {path}")
-        elif hasattr(self, 'sb3_class'):
-            self.model = self.sb3_class.load(path)
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get training statistics"""
-        return {
-            "algorithm": self.algorithm,
-            "training_steps": self.training_steps,
-            "episodes": self.episodes,
-            "epsilon": self.epsilon,
-            "mean_reward": np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0,
-            "buffer_size": len(self.replay_buffer) if hasattr(self, 'replay_buffer') else 0,
-        }
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: str, device: str = "cpu") -> "TrafficSignalAgent":
+        if not os.path.isfile(path):
+            raise ModelNotFoundError(f"RL checkpoint not found: {path}")
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        cfg_dict = dict(ckpt["config"])
+        cfg_dict["hidden_dims"] = tuple(cfg_dict["hidden_dims"])
+        cfg_dict["device"] = device
+        agent = cls(ckpt["state_dim"], ckpt["action_dim"], DQNConfig(**cfg_dict))
+        agent.q_net.load_state_dict(ckpt["q_net"])
+        agent.target_net.load_state_dict(ckpt["target_net"])
+        agent.optimizer.load_state_dict(ckpt["optimizer"])
+        agent.env_steps, agent.grad_steps, agent.episodes = ckpt["env_steps"], ckpt["grad_steps"], ckpt["episodes"]
+        return agent
+
+    def check_compatible(self, state_dim: int, action_dim: int) -> None:
+        if (self.state_dim, self.action_dim) != (state_dim, action_dim):
+            raise ConfigError(
+                f"agent trained for state/action dims ({self.state_dim}, {self.action_dim}) "
+                f"but intersection needs ({state_dim}, {action_dim})"
+            )

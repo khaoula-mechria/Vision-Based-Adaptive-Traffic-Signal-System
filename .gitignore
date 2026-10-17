@@ -139,3 +139,9 @@ temp/
 # OS files
 .DS_Store
 Thumbs.db
+
+# training outputs
+runs/
+*.pt
+models/
+!models/.gitkeep

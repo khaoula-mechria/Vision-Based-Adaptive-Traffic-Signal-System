@@ -1,0 +1,7 @@
+-r requirements.txt
+# Perception. opencv-python-headless is enough unless you need GUI windows.
+opencv-python-headless>=4.8,<6
+onnxruntime>=1.17,<2          # CPU. For NVIDIA GPUs install onnxruntime-gpu INSTEAD of onnxruntime
+ultralytics>=8.1,<9           # only needed for the PyTorch detector and for exporting weights to ONNX
+onnx>=1.15,<2                 # only needed for export
+psutil>=5.9                   # optional: memory reporting in the benchmark
